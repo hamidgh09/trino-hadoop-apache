@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.security;
 
-import static java.util.Objects.requireNonNull;
 import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_USER_GROUP_METRICS_PERCENTILES_INTERVALS;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_KERBEROS_MIN_SECONDS_BEFORE_RELOGIN;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_KERBEROS_MIN_SECONDS_BEFORE_RELOGIN_DEFAULT;
@@ -26,7 +25,6 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_KERBEROS
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_TOKEN_FILES;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_TOKENS;
 import static org.apache.hadoop.security.UGIExceptionMessages.*;
-import static org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod.KERBEROS;
 import static org.apache.hadoop.util.PlatformName.IBM_JAVA;
 import static org.apache.hadoop.util.StringUtils.getTrimmedStringCollection;
 
@@ -84,21 +82,26 @@ import org.apache.hadoop.metrics2.lib.MutableGaugeInt;
 import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
 import org.apache.hadoop.metrics2.lib.MutableQuantiles;
 import org.apache.hadoop.metrics2.lib.MutableRate;
+import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.security.SaslRpcServer.AuthMethod;
 import org.apache.hadoop.security.authentication.util.KerberosUtil;
 import org.apache.hadoop.security.authentication.util.SubjectUtil;
+import org.apache.hadoop.security.ssl.X509SecurityMaterial;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.Time;
 
 import io.hops.security.GroupAlreadyExistsException;
+import io.hops.security.SuperuserKeystoresLoader;
 import io.hops.security.UserAlreadyExistsException;
 import io.hops.security.UserAlreadyInGroupException;
 import io.hops.security.UsersGroups;
 
+import org.apache.hadoop.thirdparty.com.google.common.base.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import sun.security.x509.X500Name;
 
 /**
  * User and group information for Hadoop.
@@ -213,6 +216,28 @@ public class UserGroupInformation {
           envUser = System.getProperty(HADOOP_USER_NAME);
         }
         user = envUser == null ? null : new User(envUser);
+      }
+      if (conf.getBoolean(CommonConfigurationKeysPublic.IPC_SERVER_SSL_ENABLED,
+          CommonConfigurationKeysPublic.IPC_SERVER_SSL_ENABLED_DEFAULT)
+          && user == null) {
+        user = getCanonicalUser(KEYSTORE_PRINCIPAL_CLASS);
+        if (user != null) {
+          String subject = user.getName();
+          LOG.debug("X500 subject is " + subject);
+          try {
+            X500Name name = new X500Name(user.getName());
+            String username = name.getLocality();
+            if (username == null) {
+              username = name.getCommonName();
+            }
+            if (username != null) {
+              LOG.debug("New local user with username " + username);
+              user = new User(username);
+            }
+          } catch (IOException ex) {
+            throw (LoginException)(new LoginException(ex.toString()).initCause(ex));
+          }
+        }
       }
       // use the OS user
       if (user == null) {
@@ -430,6 +455,7 @@ public class UserGroupInformation {
 
   private static String OS_LOGIN_MODULE_NAME;
   private static Class<? extends Principal> OS_PRINCIPAL_CLASS;
+  private static Class<? extends Principal> KEYSTORE_PRINCIPAL_CLASS;
 
   private static final boolean windows =
       System.getProperty("os.name").startsWith("Windows");
@@ -464,9 +490,22 @@ public class UserGroupInformation {
     }
     return null;
   }
+
+  @SuppressWarnings("unchecked")
+  private static Class<? extends Principal> getKeystorePrincipalClass() {
+    ClassLoader cl = ClassLoader.getSystemClassLoader();
+    try {
+      return (Class<? extends Principal>) cl.loadClass("javax.security.auth.x500.X500Principal");
+    } catch (ClassNotFoundException e) {
+      LOG.error("Unable to find JAAS classes:" + e.getMessage());
+    }
+    return null;
+  }
+
   static {
     OS_LOGIN_MODULE_NAME = getOSLoginModuleName();
     OS_PRINCIPAL_CLASS = getOsPrincipalClass();
+    KEYSTORE_PRINCIPAL_CLASS = getKeystorePrincipalClass();
   }
 
   /**
@@ -2324,16 +2363,26 @@ public class UserGroupInformation {
             LoginModuleControlFlag.REQUIRED,
             BASIC_JAAS_OPTIONS);
 
+    static final AppConfigurationEntry OPTIONAL_OS_SPECIFIC_LOGIN =
+        new AppConfigurationEntry(
+            OS_LOGIN_MODULE_NAME,
+            LoginModuleControlFlag.OPTIONAL,
+            BASIC_JAAS_OPTIONS);
+
     static final AppConfigurationEntry HADOOP_LOGIN =
         new AppConfigurationEntry(
             HadoopLoginModule.class.getName(),
             LoginModuleControlFlag.REQUIRED,
             BASIC_JAAS_OPTIONS);
 
+    private static final String FILE_URL = "file://%s";
+    private final SuperuserKeystoresLoader keystoresLoader;
+
     private final LoginParams params;
 
     HadoopConfiguration(LoginParams params) {
       this.params = params;
+      keystoresLoader = new SuperuserKeystoresLoader(conf);
     }
 
     @Override
@@ -2358,8 +2407,34 @@ public class UserGroupInformation {
         }
         entries.add(getKerberosEntry());
       }
+
+      // In kubernetes we might be running with an arbitrary Container User ID.
+      // The UnixLoginModule will fail to authenticate the user because the UID
+      // does not necessarily exist.
+      // Instead we rely on the provisioned Keystores and the KeystoreLoginModule
+      // User's username will be the Locality field of certificate's Subject
+      // See HadoopLoginModule#commit()
+      String envVariableUsername = System.getenv(HADOOP_USER_NAME);
+      if (amIRunningInKubernetes() && !Strings.isNullOrEmpty(envVariableUsername)) {
+        try {
+          AppConfigurationEntry keystoreEntry = getKeystoreEntry(envVariableUsername);
+          entries.clear();
+          entries.add(OPTIONAL_OS_SPECIFIC_LOGIN);
+          entries.add(keystoreEntry);
+        } catch (IOException ex) {
+          LOG.error("Could not construct path to keystore required for the Keystore LoginModule", ex);
+          throw new RuntimeException(ex);
+        }
+      }
+
       entries.add(HADOOP_LOGIN);
+
       return entries.toArray(new AppConfigurationEntry[0]);
+    }
+
+    private boolean amIRunningInKubernetes() {
+      String kubernetesApiServer = System.getenv("KUBERNETES_SERVICE_HOST");
+      return !Strings.isNullOrEmpty(kubernetesApiServer);
     }
 
     private AppConfigurationEntry getKerberosEntry() {
@@ -2417,29 +2492,31 @@ public class UserGroupInformation {
           KRB5_LOGIN_MODULE, controlFlag, options);
     }
 
+    private AppConfigurationEntry getKeystoreEntry(String username) throws IOException {
+      X509SecurityMaterial material = keystoresLoader.loadSuperUserMaterial(username);
+
+      String keystoreAlias = getKeystoreAlias();
+      Map<String, String> params = new HashMap<>();
+      params.put("keyStoreAlias", keystoreAlias);
+      params.put("keyStoreURL", String.format(FILE_URL, material.getKeyStoreLocation().toAbsolutePath()));
+      params.put("keyStorePasswordURL", String.format(FILE_URL, material.getPasswdLocation().toAbsolutePath()));
+      params.put("privateKeyPasswordURL", String.format(FILE_URL, material.getPasswdLocation().toAbsolutePath()));
+
+      return new AppConfigurationEntry("com.sun.security.auth.module.KeyStoreLoginModule",
+              LoginModuleControlFlag.OPTIONAL, params);
+    }
+
+    private String getKeystoreAlias() {
+      String keystoreAlias = System.getenv("UGI_KEYSTORE_ALIAS");
+      return keystoreAlias != null ? keystoreAlias
+          : System.getProperty("ugi.keystoreloginmodule.alias", "own");
+    }
+
     private static String prependFileAuthority(String keytabPath) {
       return keytabPath.startsWith("file://")
           ? keytabPath
           : "file://" + keytabPath;
     }
-  }
-
-  public static UserGroupInformation createUserGroupInformationForSubject(Subject subject) {
-    requireNonNull(subject, "subject is null");
-    Set<KerberosPrincipal> kerberosPrincipals = subject.getPrincipals(KerberosPrincipal.class);
-    if (kerberosPrincipals.isEmpty()) {
-      throw new IllegalArgumentException("subject must contain a KerberosPrincipal");
-    }
-    if (kerberosPrincipals.size() != 1) {
-      throw new IllegalArgumentException("subject must contain only a single KerberosPrincipal");
-    }
-
-    KerberosPrincipal principal = kerberosPrincipals.iterator().next();
-    User user = new User(principal.getName(), KERBEROS, null);
-    subject.getPrincipals().add(user);
-    UserGroupInformation userGroupInformation = new UserGroupInformation(subject);
-    userGroupInformation.setAuthenticationMethod(KERBEROS);
-    return userGroupInformation;
   }
 
   /**

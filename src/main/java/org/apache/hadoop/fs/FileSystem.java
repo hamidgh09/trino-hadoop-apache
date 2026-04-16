@@ -264,7 +264,7 @@ public abstract class FileSystem extends Configured
    * @param user to perform the get as
    * @return the filesystem instance
    * @throws IOException failure to load
-   * @throws InterruptedException If the {@code UGI.doAs()} call was
+   * @throws InterruptedException If the {@code UGI.callAs()} call was
    * somehow interrupted.
    */
   public static FileSystem get(final URI uri, final Configuration conf,
@@ -580,7 +580,7 @@ public abstract class FileSystem extends Configured
    * @param user to perform the get as
    * @return filesystem instance
    * @throws IOException if the FileSystem cannot be instantiated.
-   * @throws InterruptedException If the {@code UGI.doAs()} call was
+   * @throws InterruptedException If the {@code UGI.callAs()} call was
    *         somehow interrupted.
    */
   public static FileSystem newInstance(final URI uri, final Configuration conf,
