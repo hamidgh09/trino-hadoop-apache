@@ -35,6 +35,7 @@ import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authentication.client.ConnectionConfigurator;
 import org.apache.hadoop.security.ssl.SSLFactory;
+import io.hops.security.HopsFileBasedKeyStoresFactory;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.security.token.TokenRenewer;
@@ -387,6 +388,10 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     canonicalService = SecurityUtil.buildTokenService(serviceUri);
 
     if ("https".equalsIgnoreCase(kmsUrl.getProtocol())) {
+      if (conf.getBoolean(CommonConfigurationKeysPublic.IPC_SERVER_SSL_ENABLED,
+              CommonConfigurationKeysPublic.IPC_SERVER_SSL_ENABLED_DEFAULT)) {
+        conf.set(SSLFactory.KEYSTORES_FACTORY_CLASS_KEY, HopsFileBasedKeyStoresFactory.class.getCanonicalName());
+      }
       sslFactory = new SSLFactory(SSLFactory.Mode.CLIENT, conf);
       try {
         sslFactory.init();
@@ -1135,6 +1140,18 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     return token;
   }
 
+  private boolean containsKmsDt(UserGroupInformation ugi) throws IOException {
+    // Add existing credentials from the UGI, since provider is cached.
+    Credentials creds = ugi.getCredentials();
+    if (!creds.getAllTokens().isEmpty()) {
+      LOG.debug("Searching for KMS delegation token in user {}'s credentials",
+          ugi);
+      return clientTokenProvider.selectDelegationToken(creds) != null;
+    }
+
+    return false;
+  }
+
   @VisibleForTesting
   UserGroupInformation getActualUgi() throws IOException {
     final UserGroupInformation currentUgi = UserGroupInformation
@@ -1147,6 +1164,15 @@ public class KMSClientProvider extends KeyProvider implements CryptoExtension,
     if (currentUgi.getRealUser() != null) {
       // Use real user for proxy user
       actualUgi = currentUgi.getRealUser();
+    }
+    if (UserGroupInformation.isSecurityEnabled() &&
+        !containsKmsDt(actualUgi) && !actualUgi.shouldRelogin()) {
+      // Use login user is only necessary when Kerberos is enabled
+      // but the actual user does not have either
+      // Kerberos credential or KMS delegation token for KMS operations
+      LOG.debug("Using loginUser when Kerberos is enabled but the actual user" +
+          " does not have either KMS Delegation Token or Kerberos Credentials");
+      actualUgi = UserGroupInformation.getLoginUser();
     }
     return actualUgi;
   }
